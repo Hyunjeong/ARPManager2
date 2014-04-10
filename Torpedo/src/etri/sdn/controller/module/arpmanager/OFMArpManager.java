@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
@@ -53,6 +54,7 @@ import etri.sdn.controller.module.routing.IRoutingService;
 import etri.sdn.controller.module.routing.Route;
 import etri.sdn.controller.module.topologymanager.ITopologyService;
 import etri.sdn.controller.protocol.OFProtocol;
+import etri.sdn.controller.protocol.SwitchInfo;
 import etri.sdn.controller.protocol.io.Connection;
 import etri.sdn.controller.protocol.io.IOFSwitch;
 import etri.sdn.controller.protocol.packet.ARP;
@@ -61,22 +63,34 @@ import etri.sdn.controller.util.AppCookie;
 import etri.sdn.controller.util.Logger;
 
 public class OFMArpManager extends OFModule {
-	
+
 	public static Map<String, Object> arptable = new HashMap<String, Object>();
-	
+
 	public static short FLOWMOD_DEFAULT_IDLE_TIMEOUT = 5; 	// in seconds
 	public static short FLOWMOD_DEFAULT_HARD_TIMEOUT = 0; 	// infinite
 	public static short FLOWMOD_DEFAULT_PRIORITY = 10;
-	
+
 	// flow-mod - for use in the cookie
 	public static final int ARP_MANAGER_APP = 21; // TODO: This must be managed
 	// by a global APP_ID class
 	private long appCookie = AppCookie.makeCookie(ARP_MANAGER_APP, 0);
+
+	private static final int LEARNING_SWITCH_APP_ID = 1;
+	private static final int APP_ID_BITS = 12;
+	private static final int APP_ID_SHIFT = (64 - APP_ID_BITS);
+	private static final long LEARNING_SWITCH_COOKIE = (long) (LEARNING_SWITCH_APP_ID & ((1 << APP_ID_BITS) - 1)) << APP_ID_SHIFT;
+
+	private static final short IDLE_TIMEOUT_DEFAULT = 5;
+	private static final short HARD_TIMEOUT_DEFAULT = 0;
+	private static final short PRIORITY_DEFAULT = 100;
+	// normally, setup reverse flow as well. 
+	private static final boolean LEARNING_SWITCH_REVERSE_FLOW = true;
+	private static final int MAX_MACS_PER_SWITCH  = 1000; 
 	
 	IDeviceService deviceManager = null;
 	ITopologyService topology = null;
 	IRoutingService routingEngine = null;
-	
+
 	private byte[] bcontrollerMac = null;
 	byte[] bopcode = new byte[]{0x00, 0x02};
 
@@ -88,7 +102,7 @@ public class OFMArpManager extends OFModule {
 			return d1ClusterId.compareTo(d2ClusterId);
 		}
 	};
-	
+
 	private OFProtocol protocol;
 
 	private void addToARPTable(String IP, String MAC) {
@@ -102,7 +116,7 @@ public class OFMArpManager extends OFModule {
 		} else
 			return "";
 	}
-	
+
 	@Override
 	protected Collection<Class<? extends IService>> services() {
 		return Collections.emptyList();
@@ -130,8 +144,8 @@ public class OFMArpManager extends OFModule {
 				return false;
 			}
 		});
-		
-		
+
+
 		InetAddress addr = null;
 		try {
 			addr = InetAddress.getLocalHost();
@@ -154,7 +168,7 @@ public class OFMArpManager extends OFModule {
 			// TODO Auto-generated catch block
 			e1.printStackTrace();
 		}
-		
+
 	}
 
 	@Override
@@ -206,6 +220,87 @@ public class OFMArpManager extends OFModule {
 
 		return true;
 	}
+	private void writePacketOutForPacketIn(IOFSwitch sw, 
+			OFPacketIn packetInMessage, 
+			OFPort egressPort,
+			OFPort getInputPort,
+			List<OFMessage> out) {
+		
+		OFFactory fac = OFFactories.getFactory(packetInMessage.getVersion());
+		OFPacketOut.Builder po = fac.buildPacketOut();
+		
+		List<OFAction> actions = new LinkedList<OFAction>();
+		OFActionOutput.Builder action_output = fac.actions().buildOutput();
+		actions.add( action_output.setPort(egressPort).setMaxLen(0xffff).build());
+		
+		po
+		.setBufferId(packetInMessage.getBufferId())
+		.setInPort(getInputPort)
+		.setActions(actions);
+		
+//		if ( po.getBufferId() == OFBufferId.NO_BUFFER ) {
+			po.setData( packetInMessage.getData() );
+//		}
+
+		// TODO: counter store support
+		//		counterStore.updatePktOutFMCounterStore(sw, packetOutMessage);
+		out.add(po.build());
+	}
+	private void writeFlowMod(IOFSwitch sw, OFFlowModCommand command, OFBufferId ofBufferId,
+			Match match, OFPort outPort, List<OFMessage> out) {
+		
+		OFFactory fac = OFFactories.getFactory(sw.getVersion());
+
+		OFFlowMod.Builder fm = null;
+		switch ( command ){
+		case ADD:
+			fm = fac.buildFlowAdd();
+			break;
+		case DELETE:
+			fm = fac.buildFlowDelete();
+			break;
+		case MODIFY:
+			fm = fac.buildFlowModify();
+			break;
+		case DELETE_STRICT:
+			fm = fac.buildFlowDeleteStrict();
+			break;
+		case MODIFY_STRICT:
+			fm = fac.buildFlowModifyStrict();
+			break;
+		}
+		
+		List<OFAction> actions = new LinkedList<OFAction>();
+		OFActionOutput.Builder action = fac.actions().buildOutput();
+		action
+		.setPort(outPort)
+		.setMaxLen(0xffff);
+		actions.add(action.build());
+		
+		try {
+			fm
+			.setCookie(U64.of(LEARNING_SWITCH_COOKIE))
+			.setIdleTimeout(IDLE_TIMEOUT_DEFAULT)
+			.setHardTimeout(HARD_TIMEOUT_DEFAULT)
+			.setPriority(PRIORITY_DEFAULT)
+			.setBufferId(ofBufferId)
+			.setOutPort((command != OFFlowModCommand.DELETE)?outPort:OFPort.ANY /*for 1.0, this is NONE */)
+			.setMatch(match)
+			.setFlags((command != OFFlowModCommand.DELETE)?EnumSet.of(OFFlowModFlags.SEND_FLOW_REM):EnumSet.noneOf(OFFlowModFlags.class))
+			.setActions(actions);
+		} catch ( UnsupportedOperationException u ) {
+			// probably from setActions() method
+			List<OFInstruction> instructions = new LinkedList<OFInstruction>();
+			OFInstructionApplyActions.Builder instruction = fac.instructions().buildApplyActions();
+			instructions.add( instruction.setActions(actions).build() );
+			
+			fm
+			.setInstructions( instructions )
+			.setTableId(TableId.ZERO);
+		}
+
+		out.add(fm.build());
+	}
 	@Override
 	protected boolean handleMessage(Connection conn, MessageContext context,
 			OFMessage msg, List<OFMessage> outgoing) {
@@ -221,31 +316,7 @@ public class OFMArpManager extends OFModule {
 			match = this.protocol.loadOFMatchFromPacket(conn.getSwitch(), pi.getData(), pi.getInPort(), true);
 		}
 
-		OFPort inputPort = match.get(MatchField.IN_PORT);
-		MacAddress sourceMac = match.get(MatchField.ETH_SRC);
-		MacAddress destMac = match.get(MatchField.ETH_DST);
-		EthType etherType = match.get(MatchField.ETH_TYPE);
-		OFVlanVidMatch vm = match.get(MatchField.VLAN_VID);
-		VlanVid vlan = (vm != null)?vm.getVlanVid():null;
 
-		Match.Builder target = match.createBuilder();
-		if ( inputPort != null ) {
-			target.setExact(MatchField.IN_PORT, inputPort);
-		}
-		if ( etherType != null ) {
-			target.setExact(MatchField.ETH_TYPE, etherType);
-		}
-		if ( vlan != null ) {
-			target.setExact(MatchField.VLAN_VID, vm);
-		}
-		if ( sourceMac != null ) {
-			target.setExact(MatchField.ETH_SRC, sourceMac);
-		}
-		if ( destMac != null ) {
-			target.setExact(MatchField.ETH_DST, destMac);
-		}
-
-		match = target.build();
 
 		byte[] bsourceIP = Arrays.copyOfRange(packetData, 28, 32);
 		byte[] bdestinationIP = Arrays.copyOfRange(packetData, 38, 42);
@@ -261,12 +332,13 @@ public class OFMArpManager extends OFModule {
 
 		if(!isGratuitous(bsourceIP, bdestinationIP)){
 			addToARPTable(ssourceIP, ssourceMAC);
-//			System.out.println("add To table : " + ssourceIP + " " + ssourceMAC);
+			//			System.out.println("add To table : " + ssourceIP + " " + ssourceMAC);
 			if(opCode == ARP.OP_REQUEST) {
 				String sfindedDestinationMAC = lookupARPTable(sdestinationIP);
 				if(sfindedDestinationMAC != "" && sfindedDestinationMAC != null) {
 
-//					System.out.println("findedDestinationMAC : " + sfindedDestinationMAC + " dIP : " + sdestinationIP + "\t");
+					System.out.println("11111");
+					//					System.out.println("findedDestinationMAC : " + sfindedDestinationMAC + " dIP : " + sdestinationIP + "\t");
 
 					byte[] bfindedDestinationMAC = HexString.fromHexString(sfindedDestinationMAC);
 					//
@@ -284,23 +356,93 @@ public class OFMArpManager extends OFModule {
 					System.arraycopy(bsourceIP, 0, packetData, 38, bsourceIP.length);
 					System.arraycopy(bdestinationIP, 0, packetData, 28, bdestinationIP.length);
 					System.arraycopy(bopcode, 0, packetData, 20, bopcode.length);
-					//					//					
-					//					//					
-					//					//					// flow rule울 switch에 보내고
-					//					//					
-					//					////					long ldestinationMAC = HexString.toLong(ssourceMAC);
-					//					////					IDevice destDevice = findDestinationDevice(ldestinationMAC, vlan, IPv4.toIPv4Address(bsourceIP));
-					//					//					
+
+					
+					OFPort inputPort = match.get(MatchField.IN_PORT);
+					MacAddress sourceMac = match.get(MatchField.ETH_SRC);
+					MacAddress destMac = match.get(MatchField.ETH_DST);
+					EthType etherType = match.get(MatchField.ETH_TYPE);
+					OFVlanVidMatch vm = match.get(MatchField.VLAN_VID);
+					VlanVid vlan = (vm != null)?vm.getVlanVid():null;
+
+					Match.Builder target = match.createBuilder();
+					if ( inputPort != null ) {
+						target.setExact(MatchField.IN_PORT, inputPort);
+					}
+					if ( etherType != null ) {
+						target.setExact(MatchField.ETH_TYPE, etherType);
+					}
+					if ( vlan != null ) {
+						target.setExact(MatchField.VLAN_VID, vm);
+					}
+					if ( sourceMac != null ) {
+						target.setExact(MatchField.ETH_SRC, MacAddress.of(bfindedDestinationMAC));
+					}
+					if ( destMac != null ) {
+						target.setExact(MatchField.ETH_DST, sourceMac);
+					}
+
+					match = target.build();
+					
+					// flow rule울 switch에 보내고
+					OFPort outPort = inputPort;
+
+					if (outPort == null) {
+						// If we haven't learned the port for the dest MAC/VLAN, flood it
+						// Don't flood broadcast packets if the broadcast is disabled.
+						// XXX For LearningSwitch this doesn't do much. The sourceMac is removed
+						//     from port map whenever a flow expires, so you would still see
+						//     a lot of floods.
+						this.writePacketOutForPacketIn(conn.getSwitch(), pi, OFPort.FLOOD, inputPort, outgoing);
+					} else {
+						// Add flow table entry matching source MAC, dest MAC, VLAN and input port
+						// that sends to the port we previously learned for the dest MAC/VLAN.  Also
+						// add a flow table entry with source and destination MACs reversed, and
+						// input and output ports reversed.  When either entry expires due to idle
+						// timeout, remove the other one.  This ensures that if a device moves to
+						// a different port, a constant stream of packets headed to the device at
+						// its former location does not keep the stale entry alive forever.
+						// FIXME: current HP switches ignore DL_SRC and DL_DST fields, so we have to match on
+						// NW_SRC and NW_DST as well
+						
+						this.writePacketOutForPacketIn(conn.getSwitch(), pi, outPort, inputPort, outgoing);
+
+						// setting buffer id and do not write packet out cause some 
+						// initial ping messages dropped for OF1.3 switches.
+						this.writeFlowMod(conn.getSwitch(), OFFlowModCommand.ADD, 
+								OFBufferId.NO_BUFFER/*pi.getBufferId()*/, match, outPort, outgoing);
+
+					}
+					return false;
+
 				}
 				else
 				{
-					System.out.println(bopcode);
+					//					System.out.println("===flooding===");
 					doFlood(conn.getSwitch(), pi, context);
 					return false;
 				}
 			}
+			// ARP reply packet
 			else {
-				
+//				long ldestinationMacOfReply = HexString.toLong(sdestinationMAC);
+//				IDevice destinationDeviceOfReply = null;
+//				try{
+//					destinationDeviceOfReply = findDestinationDevice(ldestinationMacOfReply, vlan.getVlan(), IPv4.toIPv4Address(bsourceIP));
+//				}catch(NullPointerException ex)
+//				{
+//					System.out.println(ldestinationMacOfReply + " / " + vlan.getVlan() + " / " + bsourceIP);
+//				}
+//				if(destinationDeviceOfReply == null){
+//					doFlood(conn.getSwitch(), pi, context);
+//					return false;
+//				}
+//				else{
+//					SwitchPort[] destinationSwPortOfReply = destinationDeviceOfReply.getAttachmentPoints();
+//					Short outPort = destinationSwPortOfReply[0].getPort().getShortPortNumber();
+//					destinationSwPortOfReply[0].getSwitchDPID();
+//					
+//				}
 			}
 		}
 		// GARP
@@ -310,7 +452,7 @@ public class OFMArpManager extends OFModule {
 		}
 		return true;
 	}
-	
+
 	protected OFPort getInputPort(OFPacketIn pi) {
 		if ( pi == null ) {
 			throw new AssertionError("pi cannot refer null");
@@ -326,7 +468,7 @@ public class OFMArpManager extends OFModule {
 			}
 		}
 	}
-	
+
 	/**
 	 * Creates a OFPacketOut with packetin that is flooded on all ports
 	 * unless the port is blocked, in which case the packet will be dropped.
@@ -337,30 +479,30 @@ public class OFMArpManager extends OFModule {
 	 */
 	protected void doFlood(IOFSwitch sw, OFPacketIn pi, MessageContext cntx) {
 		OFPort inPort = getInputPort(pi);
-		
+
 		if (! topology.isIncomingBroadcastAllowed(sw.getId(), inPort) ) {
 			return;
 		}
 
 		OFFactory fac = OFFactories.getFactory(pi.getVersion());
-		
+
 		// Set Action to flood
 		OFPacketOut.Builder po = fac.buildPacketOut();
-		
+
 		po
 		.setBufferId(pi.getBufferId())
 		.setInPort(inPort);
-		
+
 		List<OFAction> actions = new ArrayList<OFAction>();
 		OFActionOutput.Builder action_output = fac.actions().buildOutput();
-		
+
 		if (sw.hasAttribute(IOFSwitch.PROP_SUPPORTS_OFPP_FLOOD)) {
 			action_output.setPort(OFPort.FLOOD);
 		} else {
 			action_output.setPort(OFPort.ALL);
 		}
 		action_output.setMaxLen((short)0xffff);
-		
+
 		actions.add(action_output.build());
 		po.setActions(actions);
 
@@ -368,12 +510,12 @@ public class OFMArpManager extends OFModule {
 		if (pi.getBufferId() == OFBufferId.NO_BUFFER ) {
 			po.setData( pi.getData() );
 		}
-		
+
 		sw.getConnection().write(po.build());            
 
 		return;
 	}
-	
+
 	/**
 	 * Pushes a packet-out to a switch. The assumption here is that the packet-in 
 	 * was also generated from the same switch. Thus, if the input port of the
@@ -392,7 +534,7 @@ public class OFMArpManager extends OFModule {
 			return;
 		}
 		OFPort inPort = getInputPort(pi);
-		
+
 		if ( outPort.equals(inPort) ){
 			Logger.stdout("Packet out not sent as the outport matches inport. " + pi.toString());
 			return;
@@ -403,7 +545,7 @@ public class OFMArpManager extends OFModule {
 		if ( inPort.equals(outPort) ) {
 			return;
 		}
-		
+
 		OFFactory fac = OFFactories.getFactory(pi.getVersion());
 
 		// set actions
@@ -413,7 +555,7 @@ public class OFMArpManager extends OFModule {
 		action_output.setMaxLen((short)0xffff);
 		action_output.setPort(outPort);
 		actions.add(action_output.build());
-		
+
 		OFPacketOut.Builder po = fac.buildPacketOut().setActions(actions);
 
 		// If the switch doens't support buffering set the buffer id to be none
@@ -427,11 +569,11 @@ public class OFMArpManager extends OFModule {
 		}
 
 		po.setInPort(inPort);
-		
+
 		conn.write(po.build());
 	}
-	
-	
+
+
 	/**
 	 * Pushes routes from back to front.
 	 * 
@@ -464,9 +606,9 @@ public class OFMArpManager extends OFModule {
 			OFFlowModCommand   flowModCommand) {
 
 		boolean srcSwitchIncluded = false;
-		
+
 		OFFactory fac = OFFactories.getFactory(pi.getVersion());
-		
+
 		OFFlowMod.Builder fm = null;
 		switch ( flowModCommand ){
 		case ADD:
@@ -488,13 +630,13 @@ public class OFMArpManager extends OFModule {
 
 		fm.setIdleTimeout(FLOWMOD_DEFAULT_IDLE_TIMEOUT)
 		.setHardTimeout(FLOWMOD_DEFAULT_HARD_TIMEOUT)
-//		.setBufferId(OFBufferId.NO_BUFFER)
+		//		.setBufferId(OFBufferId.NO_BUFFER)
 		.setBufferId(pi.getBufferId())
 		.setCookie(U64.of(cookie))
 		.setMatch(match)
 		.setPriority(FLOWMOD_DEFAULT_PRIORITY)
 		.setFlags( EnumSet.noneOf(OFFlowModFlags.class) );
-		
+
 		try { 
 			fm
 			.setTableId(TableId.ZERO)
@@ -502,19 +644,19 @@ public class OFMArpManager extends OFModule {
 		} catch ( UnsupportedOperationException u ) {
 			// does nothing
 		}
-		
+
 		List<NodePortTuple> switchPortList = route.getPath();
 
 		for (int indx = switchPortList.size()-1; fm != null && indx > 0; indx -= 2) {
-		
+
 			// indx and indx-1 will always have the same switch dpid.
 			long switchDPID = switchPortList.get(indx).getNodeId();
 			IOFSwitch sw = controller.getSwitch(switchDPID);
 			if (sw == null) {
-//				if (log.isWarnEnabled()) {
-//					log.warn("Unable to push route, switch at dpid {} " +
-//							"not available", switchDPID);
-//				}
+				//				if (log.isWarnEnabled()) {
+				//					log.warn("Unable to push route, switch at dpid {} " +
+				//							"not available", switchDPID);
+				//				}
 				return srcSwitchIncluded;
 			}
 
@@ -530,9 +672,9 @@ public class OFMArpManager extends OFModule {
 
 			OFPort outPort = switchPortList.get(indx).getPortId();
 			OFPort inPort = switchPortList.get(indx-1).getPortId();
-			
+
 			Match.Builder fm_match = match.createBuilder();
-			
+
 			// copy construct the original match object.
 			for ( @SuppressWarnings("rawtypes") MatchField mf : match.getMatchFields() ) {
 				if ( match.isExact(mf) ) {
@@ -541,14 +683,14 @@ public class OFMArpManager extends OFModule {
 					fm_match.setMasked(mf, match.get(mf), match.getMasked(mf));
 				}
 			}
-			
+
 			fm_match.setExact(MatchField.IN_PORT, inPort);
-			
+
 			List<OFAction> actions = new ArrayList<OFAction>();
 			OFActionOutput.Builder action_output = fac.actions().buildOutput(); 
 			action_output.setMaxLen((short)0xffff).setPort(outPort);
 			actions.add(action_output.build());
-			
+
 			try {	
 				fm.setActions( actions );
 			} catch ( UnsupportedOperationException u ) {
@@ -559,12 +701,12 @@ public class OFMArpManager extends OFModule {
 
 				fm.setInstructions( instructions );
 			}
-			
+
 			fm.setMatch(fm_match.build());
-			
+
 			fm.setBufferId(OFBufferId.NO_BUFFER); //?
 
-			// write flow-mod object to switch.
+					// write flow-mod object to switch.
 			sw.getConnection().write(fm.build());
 
 			// Push the packet out the source switch
@@ -582,9 +724,9 @@ public class OFMArpManager extends OFModule {
 	protected void doForwardFlow(IOFSwitch sw, OFPacketIn pi, 
 			MessageContext cntx,
 			boolean requestFlowRemovedNotifn) {    
-		
+
 		OFPort inPort = getInputPort(pi);
-		
+
 		Match match = protocol.loadOFMatchFromPacket(sw, pi.getData(), inPort, false);
 
 		// Check if we have the location of the destination
@@ -602,7 +744,7 @@ public class OFMArpManager extends OFModule {
 				Logger.stderr("No openflow island found for source {" + sw.getStringId() + "}/{" + inPort + "}");
 				return;
 			}
-			
+
 			// Validate that we have a destination known on the same island
 			// Validate that the source and destination are not on the same switchport
 			boolean on_same_island = false;
@@ -631,7 +773,7 @@ public class OFMArpManager extends OFModule {
 						sw.toString() + "/" + inPort + ", Action = NOP");
 				return;
 			}
-			
+
 			// Install all the routes where both src and dst have attachment points.
 			// Since the lists are stored in sorted order we can traverse the attachment
 			// points in O(m+n) time.
@@ -641,7 +783,7 @@ public class OFMArpManager extends OFModule {
 			Arrays.sort(dstDaps, clusterIdComparator);
 
 			int iSrcDaps = 0, iDstDaps = 0;
-			
+
 			while ((iSrcDaps < srcDaps.length) && (iDstDaps < dstDaps.length)) {
 				SwitchPort srcDap = srcDaps[iSrcDaps];
 				SwitchPort dstDap = dstDaps[iDstDaps];
@@ -661,14 +803,14 @@ public class OFMArpManager extends OFModule {
 										dstDap.getSwitchDPID(),
 										dstDap.getPort());
 						if (route != null) {
-//							if (log.isTraceEnabled()) {
-//								log.trace("pushRoute match={} route={} " + 
-//										"destination={}:{}",
-//										new Object[] {match, route, 
-//										dstDap.getSwitchDPID(),
-//										dstDap.getPort()});
-//							}
-							
+							//							if (log.isTraceEnabled()) {
+							//								log.trace("pushRoute match={} route={} " + 
+							//										"destination={}:{}",
+							//										new Object[] {match, route, 
+							//										dstDap.getSwitchDPID(),
+							//										dstDap.getPort()});
+							//							}
+
 							pushRoute(sw.getConnection(), route, match, pi, sw.getId(), appCookie, 
 									cntx, requestFlowRemovedNotifn, false,
 									OFFlowModCommand.ADD);
@@ -687,7 +829,7 @@ public class OFMArpManager extends OFModule {
 			doFlood(sw, pi, cntx);
 		}
 	}
-	
+
 	@Override
 	protected boolean handleDisconnect(Connection conn) {
 		// TODO Auto-generated method stub
