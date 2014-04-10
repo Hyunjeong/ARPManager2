@@ -31,6 +31,7 @@ import org.projectfloodlight.openflow.protocol.instruction.OFInstruction;
 import org.projectfloodlight.openflow.protocol.instruction.OFInstructionApplyActions;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
+import org.projectfloodlight.openflow.types.ArpOpcode;
 import org.projectfloodlight.openflow.types.EthType;
 import org.projectfloodlight.openflow.types.MacAddress;
 import org.projectfloodlight.openflow.types.OFBufferId;
@@ -224,7 +225,7 @@ public class OFMArpManager extends OFModule {
 			OFPacketIn packetInMessage, 
 			OFPort egressPort,
 			OFPort getInputPort,
-			List<OFMessage> out) {
+			List<OFMessage> out, byte[] packetData) {
 		
 		OFFactory fac = OFFactories.getFactory(packetInMessage.getVersion());
 		OFPacketOut.Builder po = fac.buildPacketOut();
@@ -239,7 +240,7 @@ public class OFMArpManager extends OFModule {
 		.setActions(actions);
 		
 //		if ( po.getBufferId() == OFBufferId.NO_BUFFER ) {
-			po.setData( packetInMessage.getData() );
+			po.setData( packetData );
 //		}
 
 		// TODO: counter store support
@@ -351,7 +352,7 @@ public class OFMArpManager extends OFModule {
 					// arp reply 만들고
 					System.arraycopy(bsourceMAC, 0, packetData, 0, bsourceMAC.length);
 					System.arraycopy(bsourceMAC, 0, packetData, 32, bsourceMAC.length);
-					System.arraycopy(bcontrollerMac, 0, packetData, 6, bcontrollerMac.length);
+					System.arraycopy(bfindedDestinationMAC, 0, packetData, 6, bcontrollerMac.length);//***
 					System.arraycopy(bfindedDestinationMAC, 0, packetData, 22, bfindedDestinationMAC.length);
 					System.arraycopy(bsourceIP, 0, packetData, 38, bsourceIP.length);
 					System.arraycopy(bdestinationIP, 0, packetData, 28, bdestinationIP.length);
@@ -375,44 +376,69 @@ public class OFMArpManager extends OFModule {
 					if ( vlan != null ) {
 						target.setExact(MatchField.VLAN_VID, vm);
 					}
-					if ( sourceMac != null ) {
+					if ( bfindedDestinationMAC != null ) {
 						target.setExact(MatchField.ETH_SRC, MacAddress.of(bfindedDestinationMAC));
 					}
-					if ( destMac != null ) {
+					if ( sourceMac != null ) {
 						target.setExact(MatchField.ETH_DST, sourceMac);
 					}
-
+					target.setExact(MatchField.ARP_OP, ArpOpcode.REPLY);
+					
+//					match = this.protocol.loadOFMatchFromPacket(conn.getSwitch(), packetData, inputPort, true);
 					match = target.build();
 					
 					// flow rule울 switch에 보내고
 					OFPort outPort = inputPort;
+					
+					this.writeFlowMod(conn.getSwitch(), OFFlowModCommand.ADD, 
+							OFBufferId.NO_BUFFER/*pi.getBufferId()*/, match, outPort, outgoing);
+					
+					pushPacket(conn, match, pi, outPort, context);
 
-					if (outPort == null) {
-						// If we haven't learned the port for the dest MAC/VLAN, flood it
-						// Don't flood broadcast packets if the broadcast is disabled.
-						// XXX For LearningSwitch this doesn't do much. The sourceMac is removed
-						//     from port map whenever a flow expires, so you would still see
-						//     a lot of floods.
-						this.writePacketOutForPacketIn(conn.getSwitch(), pi, OFPort.FLOOD, inputPort, outgoing);
-					} else {
-						// Add flow table entry matching source MAC, dest MAC, VLAN and input port
-						// that sends to the port we previously learned for the dest MAC/VLAN.  Also
-						// add a flow table entry with source and destination MACs reversed, and
-						// input and output ports reversed.  When either entry expires due to idle
-						// timeout, remove the other one.  This ensures that if a device moves to
-						// a different port, a constant stream of packets headed to the device at
-						// its former location does not keep the stale entry alive forever.
-						// FIXME: current HP switches ignore DL_SRC and DL_DST fields, so we have to match on
-						// NW_SRC and NW_DST as well
+//					if (outPort == null) {
+//						// If we haven't learned the port for the dest MAC/VLAN, flood it
+//						// Don't flood broadcast packets if the broadcast is disabled.
+//						// XXX For LearningSwitch this doesn't do much. The sourceMac is removed
+//						//     from port map whenever a flow expires, so you would still see
+//						//     a lot of floods.
+//						this.writePacketOutForPacketIn(conn.getSwitch(), pi, OFPort.FLOOD, inputPort, outgoing, packetData);
+//						System.out.println("222");
+//					} else {
+//						// Add flow table entry matching source MAC, dest MAC, VLAN and input port
+//						// that sends to the port we previously learned for the dest MAC/VLAN.  Also
+//						// add a flow table entry with source and destination MACs reversed, and
+//						// input and output ports reversed.  When either entry expires due to idle
+//						// timeout, remove the other one.  This ensures that if a device moves to
+//						// a different port, a constant stream of packets headed to the device at
+//						// its former location does not keep the stale entry alive forever.
+//						// FIXME: current HP switches ignore DL_SRC and DL_DST fields, so we have to match on
+//						// NW_SRC and NW_DST as well
+//						
+//						OFFactory fac = OFFactories.getFactory(pi.getVersion());
+//						OFPacketOut.Builder po = fac.buildPacketOut();
+//						
+//						List<OFAction> actions = new LinkedList<OFAction>();
+//						OFActionOutput.Builder action_output = fac.actions().buildOutput();
+//						actions.add( action_output.setPort(outPort).setMaxLen(0xffff).build());
+//						
+//						po
+//						.setBufferId(pi.getBufferId())exit
+					
+//						.setInPort(pi.getInPort())
+//						.setActions(actions);
+//						
+////						if ( po.getBufferId() == OFBufferId.NO_BUFFER ) {
+//							po.setData( packetData );
+////						}
+//							
+//						conn.write(po.build());
+//						
+//						// setting buffer id and do not write packet out cause some 
+//						// initial ping messages dropped for OF1.3 switches.
 						
-						this.writePacketOutForPacketIn(conn.getSwitch(), pi, outPort, inputPort, outgoing);
-
-						// setting buffer id and do not write packet out cause some 
-						// initial ping messages dropped for OF1.3 switches.
-						this.writeFlowMod(conn.getSwitch(), OFFlowModCommand.ADD, 
-								OFBufferId.NO_BUFFER/*pi.getBufferId()*/, match, outPort, outgoing);
-
-					}
+//						System.out.println("333");
+//
+//					}
 					return false;
 
 				}
@@ -535,16 +561,16 @@ public class OFMArpManager extends OFModule {
 		}
 		OFPort inPort = getInputPort(pi);
 
-		if ( outPort.equals(inPort) ){
-			Logger.stdout("Packet out not sent as the outport matches inport. " + pi.toString());
-			return;
-		}
+//		if ( outPort.equals(inPort) ){
+//			Logger.stdout("Packet out not sent as the outport matches inport. " + pi.toString());
+//			return;
+//		}
 
 		// The assumption here is (sw) is the switch that generated the packet-in. 
 		// If the input port is the same as output port, then the packet-out should be ignored.
-		if ( inPort.equals(outPort) ) {
-			return;
-		}
+//		if ( inPort.equals(outPort) ) {
+//			return;
+//		}
 
 		OFFactory fac = OFFactories.getFactory(pi.getVersion());
 
